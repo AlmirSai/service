@@ -5,11 +5,16 @@ import (
 	"log/slog"
 )
 
+// logHandler is a wrapper around slog.Handler that adds custom event hooks.
+// It allows executing additional logic (e.g., sending errors to Sentry) 
+// while still passing logs to the original handler.
 type logHandler struct {
-	handler slog.Handler
-	events  Events
+	handler slog.Handler // The underlying slog handler
+	events  Events       // Custom event handlers for different log levels
 }
 
+// newLogHandler creates a new logHandler wrapping an existing slog.Handler 
+// with custom event hooks.
 func newLogHandler(handler slog.Handler, events Events) *logHandler {
 	return &logHandler{
 		handler: handler,
@@ -17,10 +22,13 @@ func newLogHandler(handler slog.Handler, events Events) *logHandler {
 	}
 }
 
+// Enabled checks whether the given log level is enabled for this handler.
 func (h *logHandler) Enabled(ctx context.Context, level slog.Level) bool {
 	return h.handler.Enabled(ctx, level)
 }
 
+// WithAttrs returns a new handler with additional attributes attached.
+// The custom events are preserved.
 func (h *logHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	return &logHandler{
 		handler: h.handler.WithAttrs(attrs),
@@ -28,6 +36,8 @@ func (h *logHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	}
 }
 
+// WithGroup returns a new handler that groups all attributes under the given name.
+// The custom events are preserved.
 func (h *logHandler) WithGroup(name string) slog.Handler {
 	return &logHandler{
 		handler: h.handler.WithGroup(name),
@@ -35,6 +45,9 @@ func (h *logHandler) WithGroup(name string) slog.Handler {
 	}
 }
 
+// Handle processes a log record:
+// 1. Executes the corresponding custom event hook based on log level.
+// 2. Passes the record to the underlying slog.Handler for normal processing.
 func (h *logHandler) Handle(ctx context.Context, r slog.Record) error {
 	switch r.Level {
 	case slog.LevelDebug:
@@ -55,5 +68,6 @@ func (h *logHandler) Handle(ctx context.Context, r slog.Record) error {
 		}
 	}
 
+	// Always pass the record to the original handler
 	return h.handler.Handle(ctx, r)
 }
