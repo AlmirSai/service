@@ -1,0 +1,466 @@
+# Taskfile.yml — Converted from your Makefile
+# Uses go-task (https://taskfile.dev). Install with: brew install go-task/tap/go-task or from releases.
+# Run: task <name>
+
+version: '3'
+
+vars:
+  # Images and versions from Makefile
+  GOLANG: golang:1.25
+  ALPINE: alpine:3.22
+  KIND: kindest/node:v1.33.1
+  POSTGRES: postgres:17.5
+  GRAFANA: grafana/grafana:12.1.0
+  PROMETHEUS: prom/prometheus:v3.5.0
+  TEMPO: grafana/tempo:2.8.1
+  LOKI: grafana/loki:3.5.0
+  PROMTAIL: grafana/promtail:3.5.0
+
+  KIND_CLUSTER: almir-cluster
+  NAMESPACE: sales-system
+  SALES_APP: sales
+  AUTH_APP: auth
+  BASE_IMAGE_NAME: localhost/almir
+  VERSION: '0.0.1'
+  SALES_IMAGE: '{{.BASE_IMAGE_NAME}}/{{.SALES_APP}}:{{.VERSION}}'
+  METRICS_IMAGE: '{{.BASE_IMAGE_NAME}}/metrics:{{.VERSION}}'
+  AUTH_IMAGE: '{{.BASE_IMAGE_NAME}}/{{.AUTH_APP}}:{{.VERSION}}'
+  DATABASE_URL: '{{.ENV.DATABASE_URL}}'
+  ADMIN_FRONTEND_PREFIX: ./api/frontends/admin
+  BIN: myapp
+  BUILD_DIR: bin
+  GO: go
+  SHELL_PATH: /bin/ash
+  SHELL: '{{if .shellExists .SHELL_PATH}}/bin/ash{{else}}/bin/bash{{end}}'
+
+# helper functions available to templates
+meta:
+  shellExists: |
+    {{- define "shellExists" -}}
+    {{- $path := . -}}
+    {{- if eq (index (splitList ":" "") 0) "" -}}true{{- end -}}
+    {{- end -}}
+
+# Tasks
+
+tasks:
+  default:
+    desc: Build sales, metrics and auth images (maps to `make build`)
+    deps: [build]
+
+  # ------------------------
+  # Tooling / environment
+  # ------------------------
+  dev-gotooling:
+    desc: Install Go developer tooling (expvarmon, hey, staticcheck, govulncheck, goimports)
+    cmds:
+      - '{{.GO}} install github.com/divan/expvarmon@latest'
+      - '{{.GO}} install github.com/rakyll/hey@latest'
+      - '{{.GO}} install honnef.co/go/tools/cmd/staticcheck@latest'
+      - '{{.GO}} install golang.org/x/vuln/cmd/govulncheck@latest'
+      - '{{.GO}} install golang.org/x/tools/cmd/goimports@latest'
+
+  dev-brew:
+    desc: Install brew dependencies used by Makefile
+    cmds:
+      - 'brew update'
+      - 'brew list kind || brew install kind'
+      - 'brew list kubectl || brew install kubectl'
+      - 'brew list kustomize || brew install kustomize'
+      - 'brew list pgcli || brew install pgcli'
+      - 'brew list watch || brew install watch'
+
+  dev-docker:
+    desc: Pull required Docker images
+    cmds:
+      - 'docker pull {{.GOLANG}} & docker pull {{.ALPINE}} & docker pull {{.KIND}} & docker pull {{.POSTGRES}} & docker pull {{.GRAFANA}} & docker pull {{.PROMETHEUS}} & docker pull {{.TEMPO}} & docker pull {{.LOKI}} & docker pull {{.PROMTAIL}}; wait'
+
+  # ------------------------
+  # Build containers
+  # ------------------------
+  build:
+    desc: Build sales, metrics, and auth docker images
+    deps: [sales, metrics, auth]
+
+  sales:
+    desc: Build sales image
+    cmds:
+      - 'docker build -f deployments/docker/dockerfile.sales -t {{.SALES_IMAGE}} --build-arg BUILD_REF={{.VERSION}} --build-arg BUILD_DATE="$(date -u +"%Y-%m-%dT%H:%M:%SZ")" .'
+
+  metrics:
+    desc: Build metrics image
+    cmds:
+      - 'docker build -f deployments/docker/dockerfile.metrics -t {{.METRICS_IMAGE}} --build-arg BUILD_REF={{.VERSION}} --build-arg BUILD_DATE="$(date -u +"%Y-%m-%dT%H:%M:%SZ")" .'
+
+  auth:
+    desc: Build auth image
+    cmds:
+      - 'docker build -f deployments/docker/dockerfile.auth -t {{.AUTH_IMAGE}} --build-arg BUILD_REF={{.VERSION}} --build-arg BUILD_DATE="$(date -u +"%Y-%m-%dT%H:%M:%SZ")" .'
+
+  # ------------------------
+  # KIND cluster (dev-up / dev-down)
+  # ------------------------
+  dev-up:
+    desc: Create KIND cluster and import required images
+    cmds:
+      - 'kind create cluster --image {{.KIND}} --name {{.KIND_CLUSTER}} --config deployments/k8s/dev/kind-config.yaml'
+      - 'kubectl wait --timeout=120s --namespace=local-path-storage --for=condition=Available deployment/local-path-provisioner'
+      - 'docker save {{.POSTGRES}} | docker exec -i {{.KIND_CLUSTER}}-control-plane ctr --namespace=k8s.io images import - & docker save {{.GRAFANA}} | docker exec -i {{.KIND_CLUSTER}}-control-plane ctr --namespace=k8s.io images import - & docker save {{.PROMETHEUS}} | docker exec -i {{.KIND_CLUSTER}}-control-plane ctr --namespace=k8s.io images import - & docker save {{.TEMPO}} | docker exec -i {{.KIND_CLUSTER}}-control-plane ctr --namespace=k8s.io images import - & docker save {{.LOKI}} | docker exec -i {{.KIND_CLUSTER}}-control-plane ctr --namespace=k8s.io images import - & docker save {{.PROMTAIL}} | docker exec -i {{.KIND_CLUSTER}}-control-plane ctr --namespace=k8s.io images import -; wait'
+
+  dev-down:
+    desc: Delete KIND cluster
+    cmds:
+      - 'kind delete cluster --name {{.KIND_CLUSTER}}'
+
+  dev-status-all:
+    desc: Show cluster, services and pods
+    cmds:
+      - 'kubectl get nodes -o wide'
+      - 'kubectl get svc -o wide'
+      - 'kubectl get pods -o wide --watch --all-namespaces'
+
+  dev-status:
+    desc: Watch pods status (requires watch)
+    cmds:
+      - 'watch -n 2 kubectl get pods -o wide --all-namespaces'
+
+  # ------------------------
+  # Load and apply manifests
+  # ------------------------
+  dev-load:
+    desc: Load images into KIND
+    cmds:
+      - 'kind load docker-image {{.SALES_IMAGE}} --name {{.KIND_CLUSTER}} & kind load docker-image {{.METRICS_IMAGE}} --name {{.KIND_CLUSTER}} & kind load docker-image {{.AUTH_IMAGE}} --name {{.KIND_CLUSTER}}; wait'
+
+  dev-apply:
+    desc: Apply kustomize manifests to cluster (grafana, prometheus, tempo, loki, promtail, database, auth, sales)
+    cmds:
+      - 'kustomize build deployments/k8s/dev/grafana | kubectl apply -f -'
+      - 'kustomize build deployments/k8s/dev/prometheus | kubectl apply -f -'
+      - 'kustomize build deployments/k8s/dev/tempo | kubectl apply -f -'
+      - 'kustomize build deployments/k8s/dev/loki | kubectl apply -f -'
+      - 'kustomize build deployments/k8s/dev/promtail | kubectl apply -f -'
+      - 'kustomize build deployments/k8s/dev/database | kubectl apply -f -'
+      - 'kubectl rollout status --namespace={{.NAMESPACE}} --watch --timeout=120s sts/database'
+      - 'kustomize build deployments/k8s/dev/auth | kubectl apply -f -'
+      - 'kubectl wait pods --namespace={{.NAMESPACE}} --selector app={{.AUTH_APP}} --timeout=120s --for=condition=Ready'
+      - 'kustomize build deployments/k8s/dev/sales | kubectl apply -f -'
+      - 'kubectl wait pods --namespace={{.NAMESPACE}} --selector app={{.SALES_APP}} --timeout=120s --for=condition=Ready'
+
+  dev-restart:
+    desc: Restart deployments for auth and sales
+    cmds:
+      - 'kubectl rollout restart deployment {{.AUTH_APP}} --namespace={{.NAMESPACE}}'
+      - 'kubectl rollout restart deployment {{.SALES_APP}} --namespace={{.NAMESPACE}}'
+
+  dev-run:
+    desc: Build, create cluster, load images and apply manifests
+    deps: [build, dev-up, dev-load, dev-apply]
+
+  dev-update:
+    desc: Build, load images and restart
+    deps: [build, dev-load, dev-restart]
+
+  dev-update-apply:
+    desc: Build, load images and apply (update manifests)
+    deps: [build, dev-load, dev-apply]
+
+  dev-logs:
+    desc: Tail logs for sales service and pipe through logfmt
+    cmds:
+      - 'kubectl logs --namespace={{.NAMESPACE}} -l app={{.SALES_APP}} --all-containers=true -f --tail=100 --max-log-requests=6 | go run api/tooling/logfmt/main.go -service={{.SALES_APP}}'
+
+  dev-logs-auth:
+    desc: Tail logs for auth service
+    cmds:
+      - 'kubectl logs --namespace={{.NAMESPACE}} -l app={{.AUTH_APP}} --all-containers=true -f --tail=100 | go run api/tooling/logfmt/main.go'
+
+  # ------------------------
+  # Helpers: describe, logs, shell
+  # ------------------------
+  dev-describe-node:
+    cmds:
+      - 'kubectl describe node'
+
+  dev-describe-deployment:
+    cmds:
+      - 'kubectl describe deployment --namespace={{.NAMESPACE}} {{.SALES_APP}}'
+
+  dev-describe-sales:
+    cmds:
+      - 'kubectl describe pod --namespace={{.NAMESPACE}} -l app={{.SALES_APP}}'
+
+  dev-describe-auth:
+    cmds:
+      - 'kubectl describe pod --namespace={{.NAMESPACE}} -l app={{.AUTH_APP}}'
+
+  dev-describe-database:
+    cmds:
+      - 'kubectl describe pod --namespace={{.NAMESPACE}} -l app=database'
+
+  dev-logs-db:
+    cmds:
+      - 'kubectl logs --namespace={{.NAMESPACE}} -l app=database --all-containers=true -f --tail=100'
+
+  dev-logs-grafana:
+    cmds:
+      - 'kubectl logs --namespace={{.NAMESPACE}} -l app=grafana --all-containers=true -f --tail=100'
+
+  dev-shell:
+    desc: Open shell into a sales pod
+    cmds:
+      - 'kubectl exec --namespace={{.NAMESPACE}} -it $(shell kubectl get pods --namespace={{.NAMESPACE}} | grep sales | cut -c1-26) --container {{.SALES_APP}} -- /bin/sh'
+
+  dev-auth-shell:
+    desc: Open shell into an auth pod
+    cmds:
+      - 'kubectl exec --namespace={{.NAMESPACE}} -it $(shell kubectl get pods --namespace={{.NAMESPACE}} | grep auth | cut -c1-26) --container {{.AUTH_APP}} -- /bin/sh'
+
+  dev-db-shell:
+    desc: Open shell into the database pod
+    cmds:
+      - 'kubectl exec --namespace={{.NAMESPACE}} -it $(shell kubectl get pods --namespace={{.NAMESPACE}} | grep database | cut -c1-10) -- /bin/sh'
+
+  dev-database-restart:
+    cmds:
+      - 'kubectl rollout restart statefulset database --namespace={{.NAMESPACE}}'
+
+  # ------------------------
+  # Compose support
+  # ------------------------
+  compose-up:
+    cmds:
+      - 'cd ./deployments/compose/ && docker compose -f docker_compose.yaml -p compose up -d'
+
+  compose-build-up:
+    deps: [build, compose-up]
+
+  compose-down:
+    cmds:
+      - 'cd ./deployments/compose/ && docker compose -f docker_compose.yaml down'
+
+  compose-logs:
+    cmds:
+      - 'cd ./deployments/compose/ && docker compose -f docker_compose.yaml logs'
+
+  # ------------------------
+  # Admin / DB tasks
+  # ------------------------
+  migrate:
+    desc: Run migrations via admin tool
+    cmds:
+      - 'export SALES_DB_HOST=localhost; go run api/tooling/admin/main.go migrate'
+
+  seed:
+    desc: Seed DB (depends on migrate)
+    deps: [migrate]
+    cmds:
+      - 'export SALES_DB_HOST=localhost; go run api/tooling/admin/main.go seed'
+
+  pgcli:
+    cmds:
+      - 'pgcli postgresql://postgres:postgres@localhost'
+
+  liveness:
+    cmds:
+      - 'curl -i http://localhost:3000/v1/liveness'
+
+  readiness:
+    cmds:
+      - 'curl -i http://localhost:3000/v1/readiness'
+
+  token-gen:
+    cmds:
+      - 'export SALES_DB_HOST=localhost; go run api/tooling/admin/main.go gentoken 5cf37266-3473-4006-984f-9325122678b7 54bb2165-71e1-41a6-af3e-7da4a0e1e2c1'
+
+  # ------------------------
+  # Metrics & tracing
+  # ------------------------
+  metrics-view-sc:
+    cmds:
+      - 'expvarmon -ports="localhost:3010" -vars="build,requests,goroutines,errors,panics,mem:memstats.HeapAlloc,mem:memstats.HeapSys,mem:memstats.Sys"'
+
+  metrics-view:
+    cmds:
+      - 'expvarmon -ports="localhost:4020" -endpoint="/metrics" -vars="build,requests,goroutines,errors,panics,mem:memstats.HeapAlloc,mem:memstats.HeapSys,mem:memstats.Sys"'
+
+  grafana:
+    cmds:
+      - 'open http://localhost:3100/'
+
+  statsviz:
+    cmds:
+      - 'open http://localhost:3010/debug/statsviz'
+
+  # ------------------------
+  # Testing & linting
+  # ------------------------
+  test-down:
+    cmds:
+      - 'docker stop servicetest || true'
+      - 'docker rm servicetest -v || true'
+
+  test-r:
+    cmds:
+      - 'CGO_ENABLED=1 {{.GO}} test -race -count=1 ./...'
+
+  test-only:
+    cmds:
+      - 'CGO_ENABLED=0 {{.GO}} test -count=1 ./...'
+
+  lint:
+    cmds:
+      - 'CGO_ENABLED=0 {{.GO}} vet ./...'
+      - 'staticcheck -checks=all ./...'
+
+  vuln-check:
+    cmds:
+      - 'govulncheck ./...'
+
+  test:
+    deps: [test-only, lint, vuln-check]
+
+  test-race:
+    deps: [test-r, lint, vuln-check]
+
+  # ------------------------
+  # HTTP hits and load
+  # ------------------------
+  token:
+    cmds:
+      - 'curl -i --user "admin@example.com:gophers" http://localhost:6000/v1/auth/token/54bb2165-71e1-41a6-af3e-7da4a0e1e2c1'
+
+  users:
+    cmds:
+      - 'curl -i -H "Authorization: Bearer ${TOKEN}" "http://localhost:3000/v1/users?page=1&rows=2"'
+
+  users-timeout:
+    cmds:
+      - 'curl -i --max-time 1 -H "Authorization: Bearer ${TOKEN}" "http://localhost:3000/v1/users?page=1&rows=2"'
+
+  load:
+    cmds:
+      - 'hey -m GET -c 100 -n 1000 -H "Authorization: Bearer ${TOKEN}" "http://localhost:3000/v1/users?page=1&rows=2"'
+
+  otel-test:
+    cmds:
+      - 'curl -i -H "Traceparent: 00-918dd5ecf264712262b68cf2ef8b5239-896d90f23f69f006-01" --user "admin@example.com:gophers" http://localhost:6000/v1/auth/token/54bb2165-71e1-41a6-af3e-7da4a0e1e2c1'
+
+  # ------------------------
+  # Modules support
+  # ------------------------
+  deps-reset:
+    cmds:
+      - 'git checkout -- go.mod || true'
+      - '{{.GO}} mod tidy'
+      - '{{.GO}} mod vendor'
+
+  tidy:
+    cmds:
+      - '{{.GO}} mod tidy'
+      - '{{.GO}} mod vendor'
+
+  deps-list:
+    cmds:
+      - '{{.GO}} list -m -u -mod=readonly all'
+
+  deps-upgrade:
+    cmds:
+      - '{{.GO}} get -u -v ./...'
+      - '{{.GO}} mod tidy'
+      - '{{.GO}} mod vendor'
+
+  deps-cleancache:
+    cmds:
+      - '{{.GO}} clean -modcache'
+
+  list:
+    cmds:
+      - '{{.GO}} list -mod=mod all'
+
+  # ------------------------
+  # Run / admin / curl helpers
+  # ------------------------
+  run:
+    cmds:
+      - 'go run api/services/sales/main.go | go run api/tooling/logfmt/main.go'
+
+  run-help:
+    cmds:
+      - 'go run api/services/sales/main.go --help | go run api/tooling/logfmt/main.go'
+
+  curl:
+    cmds:
+      - 'curl -i http://localhost:3000/v1/hack'
+
+  curl-auth:
+    cmds:
+      - 'curl -i -H "Authorization: Bearer ${TOKEN}" http://localhost:3000/v1/hackauth'
+
+  load-hack:
+    cmds:
+      - 'hey -m GET -c 100 -n 100000 "http://localhost:3000/v1/hack"'
+
+  admin:
+    cmds:
+      - 'go run api/tooling/admin/main.go'
+
+  ready:
+    cmds:
+      - 'curl -i http://localhost:3000/v1/readiness'
+
+  live:
+    cmds:
+      - 'curl -i http://localhost:3000/v1/liveness'
+
+  curl-create:
+    cmds:
+      - 'curl -i -X POST -H "Authorization: Bearer ${TOKEN}" -H "Content-Type: application/json" -d "{\"name\":\"bill\",\"email\":\"b@gmail.com\",\"roles\":[\"ADMIN\"],\"department\":\"ITO\",\"password\":\"123\",\"passwordConfirm\":\"123\"}" http://localhost:3000/v1/users'
+
+  # ------------------------
+  # Talk alias targets (same as dev-* but preserved)
+  # ------------------------
+  talk-run:
+    deps: [build, dev-up, dev-load, dev-apply]
+
+  # ------------------------
+  # Admin frontend tasks
+  # ------------------------
+  write-token-to-env:
+    cmds:
+      - 'echo "VITE_SERVICE_API=http://localhost:3000/v1" > {{.ADMIN_FRONTEND_PREFIX}}/.env'
+      - 'task: token | grep -o '"ey.*"' | awk '{print "VITE_SERVICE_TOKEN="$$1}' >> {{.ADMIN_FRONTEND_PREFIX}}/.env'
+
+  admin-gui-install:
+    cmds:
+      - 'pnpm -C {{.ADMIN_FRONTEND_PREFIX}} install'
+
+  admin-gui-update:
+    cmds:
+      - 'pnpm -C {{.ADMIN_FRONTEND_PREFIX}} update'
+
+  admin-gui-dev:
+    deps: [admin-gui-install]
+    cmds:
+      - 'pnpm -C {{.ADMIN_FRONTEND_PREFIX}} run dev'
+
+  admin-gui-build:
+    deps: [admin-gui-install]
+    cmds:
+      - 'pnpm -C {{.ADMIN_FRONTEND_PREFIX}} run build'
+
+  admin-gui-start-build:
+    deps: [admin-gui-build]
+    cmds:
+      - 'pnpm -C {{.ADMIN_FRONTEND_PREFIX}} run preview'
+
+  admin-gui-run:
+    deps: [write-token-to-env, admin-gui-start-build]
+
+  # ------------------------
+  # Help (converted from Makefile help)
+  # ------------------------
+  help:
+    cmds:
+      - 'echo "Run: task <name> - available tasks mirror the Makefile. Use task -l to list."'
+      - 'echo "Common tasks: dev-gotooling, dev-brew, dev-docker, build, dev-up, dev-down, dev-status, dev-load, dev-apply, dev-run, dev-update, dev-logs, migrate, seed, test, lint, vuln-check, compose-up"'
