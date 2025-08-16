@@ -1,40 +1,48 @@
-# Build the Go Binary.
-FROM golang:1.24 AS build_sales
+# --- Build Stage ---
+FROM golang:1.25 AS builder
+
 ENV CGO_ENABLED=0
 ARG BUILD_REF
 
-# Create the service directory and the copy the module files first and then
-# download the dependencies. If this doesn't change, we won't need to do this
-# again in future builds.
-# RUN mkdir /service
-# COPY go.* /service/
-# WORKDIR /service
-# RUN go mod download
+# Set working directory inside container
+WORKDIR /service
 
-# Copy the source code into the container.
-COPY . /service
+# Copy module files first for caching
+COPY go.mod ./
+RUN go mod download
 
-# Build the admin binary.
-WORKDIR /service/api/tooling/admin
-RUN go build -ldflags "-X main.build=${BUILD_REF}"
+# Copy all source
+COPY . .
 
-# Build the service binary.
-WORKDIR /service/api/services/sales
-RUN go build -ldflags "-X main.build=${BUILD_REF}"
+# Build admin binary
+WORKDIR /service/apis/tooling/logfmt
+RUN go build -ldflags="-X main.build=${BUILD_REF}" -o /service/admin
 
+# Build service binary
+WORKDIR /service/apis/services/sales
+RUN go build -ldflags="-X main.build=${BUILD_REF}" -o /service/sales
 
-# Run the Go Binary in Alpine.
+# --- Runtime Stage ---
 FROM alpine:3.22
+
 ARG BUILD_DATE
 ARG BUILD_REF
+
+# Create non-root user
 RUN addgroup -g 1000 -S sales && \
     adduser -u 1000 -h /service -G sales -S sales
-COPY --from=build_sales --chown=sales:sales /service/api/tooling/admin/admin /service/admin
-COPY --from=build_sales --chown=sales:sales /service/api/services/sales/sales /service/sales
+
+# Copy binaries from builder
+COPY --from=builder --chown=sales:sales /service/admin /service/admin
+COPY --from=builder --chown=sales:sales /service/sales /service/sales
+
 WORKDIR /service
 USER sales
+
+# Default command
 CMD ["./sales"]
 
+# Metadata labels
 LABEL org.opencontainers.image.created="${BUILD_DATE}" \
       org.opencontainers.image.title="sales-api" \
       org.opencontainers.image.authors="Almir Saitov <almircodeprogram@gmail.com>" \
